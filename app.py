@@ -20,7 +20,9 @@ st.set_page_config(layout="wide", page_title="東京都 用途地域チェッカ
 # --- 設定 ---
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 SHAPEFILE_DIR = "shapefiles"
-SHAPEFILE_NAME = "用途地域.shp"
+# ▼▼▼ ファイル名を変更 ▼▼▼
+SHAPEFILE_NAME = "youto_chiiki.shp" # 日本語名から半角英数字に変更
+# ▲▲▲ ファイル名を変更 ▲▲▲
 shapefile_path = os.path.join(APP_ROOT, SHAPEFILE_DIR, SHAPEFILE_NAME)
 
 youto_code_map = {
@@ -37,6 +39,7 @@ youto_column_name = 'TUP3F1'
 @st.cache_resource
 def load_shapefile(path):
     """指定されたパスのシェイプファイルを読み込み、空間インデックスを作成して返す"""
+    st.info(f"シェイプファイル読み込み試行中: {path}") # デバッグ情報追加
     if not os.path.exists(path):
         st.error(f"エラー: シェイプファイルが見つかりません！\n探しているパス: {path}")
         try:
@@ -49,9 +52,11 @@ def load_shapefile(path):
         except Exception as e: st.warning(f"フォルダ内容の確認中にエラーが発生しました: {e}")
         return None
     try:
+        # encoding='cp932' は属性情報用なので、ファイル名変更後も必要なら残す
         gdf = gpd.read_file(path, encoding='cp932')
         gdf.sindex
         print(f"シェイプファイル読み込み成功: {path}")
+        st.success(f"シェイプファイル読み込み成功: {os.path.basename(path)}") # 成功メッセージも表示
         return gdf
     except FileNotFoundError:
          print(f"エラー: シェイプファイルが見つかりません (geopandas読み込み時): {path}")
@@ -60,8 +65,11 @@ def load_shapefile(path):
     except Exception as e:
         print(f"予期せぬエラー（シェイプファイル読み込み中）: {e}")
         traceback.print_exc()
+        # エラーメッセージをより詳細に表示
         st.error(f"シェイプファイル読み込み中に予期せぬエラーが発生しました。\n"
-                 f"ファイルパス: {path}\nエラー詳細: {e}")
+                 f"ファイルパス: {path}\n"
+                 f"エラータイプ: {type(e).__name__}\n"
+                 f"エラー詳細: {e}")
         return None
 
 @st.cache_data
@@ -99,68 +107,64 @@ def find_and_display_zone(latitude, longitude, gdf):
         point_gdf_proj = point_gdf_wgs84.to_crs(target_crs); point_proj = point_gdf_proj.geometry.iloc[0]
         st.write(f"シェイプファイルの座標系 ({target_crs}) に変換しました: X={point_proj.x:.4f}, Y={point_proj.y:.4f}")
 
-        # ▼▼▼ ここから空間検索ロジックを修正 ▼▼▼
         # 4. 空間検索 (指定した点が含まれる、または重なるポリゴンを探す)
         print(f"空間検索実行: 点={point_proj}") # サーバーログ用
         st.write(f"検索点 (投影座標系): {point_proj}") # Streamlit画面に検索点を表示（デバッグ用）
 
-        # GeoDataFrameの空間インデックスを利用して候補を検索
-        # predicate を 'contains' から 'intersects' に変更して、少し広く候補を探す
         try:
-            possible_matches_index = list(gdf.sindex.query(point_proj, predicate='intersects')) # ★ intersects に変更
-            st.write(f"空間インデックス検索 (intersects) の候補インデックス: {possible_matches_index}") # 候補インデックスを表示
-            st.write(f"空間インデックス検索 (intersects) の候補数: {len(possible_matches_index)}") # 候補数を表示
+            # predicate を 'intersects' にして候補を探す
+            possible_matches_index = list(gdf.sindex.query(point_proj, predicate='intersects'))
+            st.write(f"空間インデックス検索 (intersects) の候補インデックス: {possible_matches_index}")
+            st.write(f"空間インデックス検索 (intersects) の候補数: {len(possible_matches_index)}")
         except Exception as sindex_err:
             st.error(f"空間インデックス検索中にエラーが発生しました: {sindex_err}")
-            possible_matches_index = [] # エラー時は空リスト
+            possible_matches_index = []
 
         if not possible_matches_index:
              st.warning("空間インデックス検索 (intersects) で候補が見つかりませんでした。")
-             containing_polygon = gpd.GeoDataFrame() # 空のGeoDataFrameを作成
+             containing_polygon = gpd.GeoDataFrame()
         else:
             try:
                 possible_matches = gdf.iloc[possible_matches_index]
                 st.write(f"候補ポリゴン数: {len(possible_matches)}")
 
-                # デバッグ用に候補ポリゴンの geometry タイプを表示
-                # st.write(f"候補ポリゴンのGeometryタイプ:\n{possible_matches.geometry.geom_type}")
-
                 # 厳密な包含判定 (contains) を試みる
                 containing_polygon_strict = possible_matches[possible_matches.geometry.contains(point_proj)]
-                st.write(f"厳密な包含判定 (contains) の結果数: {len(containing_polygon_strict)}") # containsの結果数を表示
+                st.write(f"厳密な包含判定 (contains) の結果数: {len(containing_polygon_strict)}")
 
-                # もし contains で見つからなくても、intersects で候補があればそれを結果として採用する
                 if not containing_polygon_strict.empty:
                     containing_polygon = containing_polygon_strict
-                    st.info("厳密な包含判定 (contains) でポリゴンが見つかりました。")
+                    st.session_state.search_result_type = "contains" # 結果タイプを保存
                 else:
-                    # intersects した候補の中から、実際に点と交差するものだけを再フィルタリング (より安全)
+                    # intersects した候補の中から、実際に点と交差するものだけを再フィルタリング
                     intersecting_polygons = possible_matches[possible_matches.geometry.intersects(point_proj)]
                     if not intersecting_polygons.empty:
-                         containing_polygon = intersecting_polygons # intersects したものを結果とする
-                         st.warning("厳密な包含判定では見つかりませんでしたが、交差(intersects)するポリゴンを採用しました。")
-                         st.write(f"採用したポリゴン数 (intersects): {len(containing_polygon)}")
+                         containing_polygon = intersecting_polygons
+                         st.session_state.search_result_type = "intersects" # 結果タイプを保存
                     else:
-                         containing_polygon = gpd.GeoDataFrame() # intersectsでも見つからなかった
+                         containing_polygon = gpd.GeoDataFrame()
+                         st.session_state.search_result_type = "none" # 結果タイプを保存
                          st.warning("空間インデックス(intersects)で候補はありましたが、厳密な交差判定では見つかりませんでした。")
 
             except Exception as filter_err:
                  st.error(f"候補ポリゴンのフィルタリング中にエラーが発生しました: {filter_err}")
-                 containing_polygon = gpd.GeoDataFrame() # エラー時は空
+                 containing_polygon = gpd.GeoDataFrame()
+                 st.session_state.search_result_type = "error"
 
-        print(f"検索結果ポリゴン数 (最終): {len(containing_polygon)}") # サーバーログ用
-        # ▲▲▲ ここまで空間検索ロジック修正 ▲▲▲
+        print(f"検索結果ポリゴン数 (最終): {len(containing_polygon)}")
 
         # 5. 結果の表示
         st.subheader("検索結果")
-        if not containing_polygon.empty:
-            # 以前はここでst.successを表示していたが、intersectsの場合もあるのでメッセージを調整
-            if '厳密な包含判定 (contains) でポリゴンが見つかりました。' in st.session_state.get('info_messages', []): # 仮のチェック方法
-                 st.success("指定された地点は以下の用途地域に含まれます。")
-            else:
-                 st.warning("指定された地点に交差する以下の用途地域が見つかりました。(境界付近の可能性があります)")
+        result_type = st.session_state.get('search_result_type', 'none') # 保存した結果タイプを取得
 
-            # 複数のポリゴンに重なって含まれる/交差する場合も考慮
+        if not containing_polygon.empty:
+            if result_type == "contains":
+                 st.success("指定された地点は以下の用途地域に含まれます。")
+            elif result_type == "intersects":
+                 st.warning("指定された地点に交差する以下の用途地域が見つかりました。(境界付近の可能性があります)")
+            else: # intersectsでヒットしたがタイプ不明の場合など
+                 st.info("指定された地点に関連する以下の用途地域が見つかりました。")
+
             for index, row in containing_polygon.iterrows():
                  with st.container(border=True):
                     youto_code = row.get(youto_column_name, None); youto_name = youto_code_map.get(youto_code, f"不明なコード({youto_code})") if youto_code is not None else "取得不可"; st.markdown(f"**用途地域:** {youto_name} (コード: {youto_code})")
@@ -183,40 +187,19 @@ def find_and_display_zone(latitude, longitude, gdf):
             # --- 地図表示 (pydeck) ---
             st.subheader("地図表示")
             try:
-                point_data_for_deck = point_gdf_wgs84[['geometry']].copy()
-                point_data_for_deck['coordinates'] = point_data_for_deck.geometry.apply(lambda p: [p.x, p.y])
-                point_layer = pdk.Layer(
-                    "ScatterplotLayer", data=point_data_for_deck, get_position="coordinates",
-                    get_color="[255, 0, 0, 200]", get_radius=15, radius_min_pixels=7, pickable=True, )
-
-                # ▼ オプション: 該当ポリゴンも表示する場合（intersectsで複数になる可能性あり）▼
-                polygon_disp_gdf = containing_polygon.to_crs("EPSG:4326")
-                polygon_geojson = polygon_disp_gdf.__geo_interface__
-                polygon_layer = pdk.Layer(
-                    "GeoJsonLayer", data=polygon_geojson, opacity=0.3, stroked=True, filled=True,
-                    extruded=False, wireframe=True, get_fill_color='[255, 255, 0, 90]',
-                    get_line_color=[255, 255, 0, 200], get_line_width=5, line_width_min_pixels=1, pickable=True,)
-                # ▲▲▲
-
+                point_data_for_deck = point_gdf_wgs84[['geometry']].copy(); point_data_for_deck['coordinates'] = point_data_for_deck.geometry.apply(lambda p: [p.x, p.y])
+                point_layer = pdk.Layer("ScatterplotLayer", data=point_data_for_deck, get_position="coordinates", get_color="[255, 0, 0, 200]", get_radius=15, radius_min_pixels=7, pickable=True,)
+                polygon_disp_gdf = containing_polygon.to_crs("EPSG:4326"); polygon_geojson = polygon_disp_gdf.__geo_interface__
+                polygon_layer = pdk.Layer("GeoJsonLayer", data=polygon_geojson, opacity=0.3, stroked=True, filled=True, extruded=False, wireframe=True, get_fill_color='[255, 255, 0, 90]', get_line_color=[255, 255, 0, 200], get_line_width=5, line_width_min_pixels=1, pickable=True,)
                 view_state = pdk.ViewState(latitude=latitude, longitude=longitude, zoom=16, pitch=45, bearing=0)
-                deck = pdk.Deck(
-                    # ▼ ポリゴンも表示する場合は polygon_layer を追加 ▼
-                    layers=[point_layer, polygon_layer],
-                    initial_view_state=view_state, map_style='mapbox://styles/mapbox/light-v10',
-                    tooltip={"text": f"検索地点\nLat: {latitude:.6f}\nLon: {longitude:.6f}"})
-                st.pydeck_chart(deck)
-                st.success("地図表示完了 (pydeck - ポイント＋該当エリア)") # メッセージ変更
+                deck = pdk.Deck(layers=[point_layer, polygon_layer], initial_view_state=view_state, map_style='mapbox://styles/mapbox/light-v10', tooltip={"text": f"検索地点\nLat: {latitude:.6f}\nLon: {longitude:.6f}"})
+                st.pydeck_chart(deck); st.success("地図表示完了 (pydeck - ポイント＋該当エリア)")
+            except ImportError: st.info("地図表示ライブラリ `pydeck` が見つかりません。簡易地図を表示します。"); map_df = pd.DataFrame({'lat': [latitude], 'lon': [longitude]}); st.map(map_df, zoom=16)
+            except Exception as map_e: st.warning(f"pydeck地図表示中にエラーが発生しました: {map_e}"); traceback.print_exc(); st.info("簡易地図を表示します。"); map_df = pd.DataFrame({'lat': [latitude], 'lon': [longitude]}); st.map(map_df, zoom=16)
 
-            except ImportError:
-                st.info("地図表示ライブラリ `pydeck` が見つかりません。簡易地図を表示します。")
-                map_df = pd.DataFrame({'lat': [latitude], 'lon': [longitude]}); st.map(map_df, zoom=16)
-            except Exception as map_e:
-                st.warning(f"pydeck地図表示中にエラーが発生しました: {map_e}"); traceback.print_exc()
-                st.info("簡易地図を表示します。"); map_df = pd.DataFrame({'lat': [latitude], 'lon': [longitude]}); st.map(map_df, zoom=16)
-
-        else: # if not containing_polygon.empty: のelse (データが見つからなかった場合)
-            # メッセージは検索ロジック内で表示済みのはず
-            # st.warning("指定された座標に対応する用途地域データが見つかりませんでした。") # 重複するのでコメントアウト
+        else: # if containing_polygon.empty: (データが見つからなかった場合)
+            if result_type != "error": # フィルタリングエラー以外の場合
+                 st.warning("指定された座標に対応する用途地域データが見つかりませんでした。")
             st.subheader("地図表示 (検索地点)"); map_df = pd.DataFrame({'lat': [latitude], 'lon': [longitude]}); st.map(map_df, zoom=16)
 
     except Exception as e: st.error(f"予期せぬエラー（空間検索・表示処理中）: {e}"); traceback.print_exc()
@@ -230,18 +213,12 @@ st.caption("住所または緯度経度を入力して、東京都の用途地�
 gdf_youto = load_shapefile(shapefile_path)
 
 if gdf_youto is None:
+    # load_shapefile関数内でエラーメッセージ表示済み
     st.error("シェイプファイルの読み込みに失敗したため、アプリケーションを開始できません。")
-    st.warning(f"確認されたシェイプファイルパス: {shapefile_path}")
-    st.warning(f"上記のパスにシェイプファイル一式 (最低でも .shp, .shx, .dbf) が存在するか確認してください。")
     st.stop()
 else:
-    # ▼▼▼ デバッグ用の sindex 情報表示をコメントアウト ▼▼▼
-    # with st.expander("空間インデックス情報 (デバッグ用)"):
-    #    st.help(gdf_youto.sindex)
-    # ▲▲▲
-
     with st.expander("シェイプファイル情報"):
-        st.success(f"シェイプファイル読み込み完了: {os.path.basename(shapefile_path)}")
+        # load_shapefile内で成功メッセージ表示済みのため、ここではシンプルに
         st.write(f"座標参照系(CRS): {gdf_youto.crs}")
         st.write(f"データ(ポリゴン)数: {len(gdf_youto)}")
         st.write(f"属性カラム数: {len(gdf_youto.columns)}")
@@ -249,14 +226,13 @@ else:
         except Exception as e: st.write(f"ファイル更新日時の取得に失敗しました: {e}")
 
 # --- 入力UI ---
-search_method = st.radio(
-    "検索方法を選択:", ("住所で検索", "緯度経度で検索"), horizontal=True, key="search_method")
+search_method = st.radio( "検索方法を選択:", ("住所で検索", "緯度経度で検索"), horizontal=True, key="search_method")
 
 latitude, longitude = None, None; address = ""; manual_lat, manual_lon = None, None
 if 'search_clicked' not in st.session_state: st.session_state.search_clicked = False
 search_button_pressed = False
-# ▼ デバッグメッセージ保存用 ▼
-if 'info_messages' not in st.session_state: st.session_state.info_messages = []
+# 検索結果タイプ保存用 (contains, intersects, none, error)
+if 'search_result_type' not in st.session_state: st.session_state.search_result_type = 'none'
 
 if search_method == "住所で検索":
     address = st.text_input("住所を入力してください (例: 東京都千代田区九段北4-1-3):", key="address_input")
@@ -264,7 +240,7 @@ if search_method == "住所で検索":
         if address:
             st.session_state.search_clicked = True; search_button_pressed = True
             st.session_state.manual_lat = None; st.session_state.manual_lon = None
-            st.session_state.info_messages = [] # メッセージリストをクリア
+            st.session_state.search_result_type = 'none' # 結果タイプをリセット
             with st.spinner("地理院地図APIで座標を検索中..."): latitude, longitude, geo_message = geocode_address(address)
             st.info(geo_message)
             if latitude is None or longitude is None: st.error("座標を取得できなかったため、検索を実行できません。"); st.session_state.search_clicked = False
@@ -277,11 +253,11 @@ elif search_method == "緯度経度で検索":
     if st.button("緯度経度で検索実行", key="latlon_search_button"):
         if latitude is not None and longitude is not None and -90 <= latitude <= 90 and -180 <= longitude <= 180:
              st.session_state.search_clicked = True; search_button_pressed = True
-             st.session_state.info_messages = [] # メッセージリストをクリア
+             st.session_state.search_result_type = 'none' # 結果タイプをリセット
         else: st.warning("有効な緯度と経度を入力してください。"); st.session_state.search_clicked = False
 
 # --- 検索実行と結果表示 ---
-if st.session_state.search_clicked:
+if st.session_state.search_clicked and gdf_youto is not None: # gdfが読み込めている場合のみ実行
     if latitude is not None and longitude is not None and latitude != 0 and longitude != 0:
         with st.spinner("用途地域を検索中..."): find_and_display_zone(latitude, longitude, gdf_youto)
     elif search_button_pressed: pass
